@@ -1,4 +1,4 @@
-name: Flask Application CI
+name: Flask Application CI/CD
 
 on:
   push:
@@ -20,46 +20,89 @@ jobs:
     - name: Install dependencies
       run: |
         python -m pip install --upgrade pip
-        pip install flask requests beautifulsoup4
-        # Install any missing dependencies from your code
-        # If you have a requirements.txt file, uncomment the next line:
-        # if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
+        if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
 
     - name: Lint code
       run: |
         pip install flake8
         flake8 . --count --select=E9,F63,F7,F82 --show-source --statistics
 
-    - name: Check directory structure
+    - name: Test app initialization
       run: |
-        # Make sure templates directory exists
+        # Tạo thư mục templates cơ bản cho testing
         mkdir -p templates
-
-    - name: Create test template files
-      run: |
-        # Create minimal template files for testing
-        echo "<!DOCTYPE html><html><body><h1>Tracking App</h1></body></html>" > templates/index.html
-        echo "<!DOCTYPE html><html><body><h1>Results</h1></body></html>" > templates/result.html
-
-    - name: Create Util directory and util.py
-      run: |
-        mkdir -p Util
-        echo 'def detect_carrier(tracking_number):
-            """Detect carrier based on tracking number format"""
-            if tracking_number.startswith("SPXVN"):
-                return "Shopee Express (SPX)"
-            elif tracking_number.startswith("JT") or tracking_number.isdigit():
-                return "J&T Express"
-            else:
-                return "Unknown"
-        ' > Util/util.py
-
-    - name: Run Flask application tests
-      run: |
-        # Use pytest if you have tests, or just validate that the app initializes
+        echo "<!DOCTYPE html><html><body><h1>Test</h1></body></html>" > templates/index.html
+        echo "<!DOCTYPE html><html><body><h1>Test</h1></body></html>" > templates/result.html
+        
+        # Kiểm tra xem app có khởi tạo được không
         python -c "import main; print('Flask app initialized successfully')"
 
-    # Optional - run the app in background for basic validation
-    - name: Test app startup
+  deploy-to-vps:
+    needs: build-and-test  # Chỉ deploy sau khi build và test thành công
+    runs-on: ubuntu-latest
+    if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master')
+
+    steps:
+    - uses: actions/checkout@v3
+
+    - name: Set up SSH
+      uses: webfactory/ssh-agent@v0.7.0
+      with:
+        ssh-private-key: ${{ secrets.SSH_PRIVATE_KEY }}
+
+    - name: Add host key
       run: |
-        timeout 5s python main.py || code=$?; if [[ $code -ne 124 && $code -ne 0 ]]; then exit $code; fi
+        mkdir -p ~/.ssh
+        ssh-keyscan -H ${{ secrets.VPS_HOST }} >> ~/.ssh/known_hosts
+
+    - name: Deploy to VPS
+      env:
+        VPS_HOST: ${{ secrets.VPS_HOST }}
+        VPS_USERNAME: ${{ secrets.VPS_USERNAME }}
+        APP_DIR: ${{ secrets.APP_DIR }}
+      run: |
+        # Tạo một script tạm để chạy lệnh trên VPS
+        cat > deploy.sh << 'EOL'
+        #!/bin/bash
+        cd $APP_DIR
+        
+        # Pull latest code (nếu đang sử dụng git trên VPS)
+        if [ -d ".git" ]; then
+          git pull
+        else
+          # Hoặc tạo thư mục mới nếu chưa có
+          mkdir -p $APP_DIR
+        fi
+        
+        # Đảm bảo có virtualenv
+        if [ ! -d "venv" ]; then
+          python3 -m venv venv
+        fi
+        
+        # Cập nhật dependencies
+        source venv/bin/activate
+        pip install --upgrade pip
+        pip install -r requirements.txt
+        
+        # Đảm bảo thư mục templates tồn tại
+        mkdir -p templates
+        
+        # Khởi động lại service (nếu đang dùng systemd)
+        sudo systemctl restart flask-tracking-app.service || echo "Service not found, skipping restart"
+        
+        # Hoặc khởi động với tmux/screen nếu không dùng systemd
+        if ! pgrep -f "gunicorn main:app"; then
+          # Kill tiến trình cũ nếu có
+          pkill -f "gunicorn main:app" || echo "No process to kill"
+          # Khởi động gunicorn
+          cd $APP_DIR && source venv/bin/activate && \
+          nohup gunicorn main:app -b 0.0.0.0:5000 --workers 3 >> app.log 2>&1 &
+        fi
+        EOL
+        
+        # Sao chép các files lên VPS
+        scp -r ./* $VPS_USERNAME@$VPS_HOST:$APP_DIR/
+        
+        # Sao chép script lên và chạy
+        scp deploy.sh $VPS_USERNAME@$VPS_HOST:/tmp/
+        ssh $VPS_USERNAME@$VPS_HOST "chmod +x /tmp/deploy.sh && /tmp/deploy.sh"
